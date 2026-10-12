@@ -37,12 +37,81 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+_GENESIS_HASH = "0" * 64
+_REQUIRED_FIELDS = {
+    "ts", "agent_id", "run_id", "tool", "args_hash",
+    "classification", "decision", "reason",
+}
+
+
+def _digest(entry: dict) -> str:
+    payload = json.dumps(
+        entry,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous_hash = _GENESIS_HASH
+    if path.exists():
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            try:
+                previous_hash = str(json.loads(lines[-1])["hash"])
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise ValueError("cannot append to a malformed ledger") from exc
+
+    record = dict(entry)
+    record.pop("hash", None)
+    record["prev_hash"] = previous_hash
+    record["hash"] = _digest(record)
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return False
+
+    expected_previous = _GENESIS_HASH
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    if not lines:
+        return True
+
+    for line in lines:
+        if not line.strip():
+            return False
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(record, dict) or not _REQUIRED_FIELDS.issubset(record):
+            return False
+        if not isinstance(record.get("reason"), str) or not record["reason"].strip():
+            return False
+        if record.get("prev_hash") != expected_previous:
+            return False
+        stored_hash = record.get("hash")
+        if not isinstance(stored_hash, str) or len(stored_hash) != 64:
+            return False
+        unsigned = dict(record)
+        unsigned.pop("hash", None)
+        if _digest(unsigned) != stored_hash:
+            return False
+        expected_previous = stored_hash
+    return True

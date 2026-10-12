@@ -34,7 +34,14 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+_PRINCIPALS_PATH = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+_CLASSIFICATIONS = {"public", "internal", "restricted"}
 
 
 @dataclass(frozen=True)
@@ -52,4 +59,51 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    # This mandatory data/egress rule is evaluated first and stands even
+    # when legacy callers do not yet supply OBO fields.
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot be used in an egress-enabled call"
+
+    if context.data_classification not in _CLASSIFICATIONS:
+        return False, f"unknown data classification: {context.data_classification!r}"
+    if context.delegation_depth < 0:
+        return False, "delegation_depth cannot be negative"
+    if not context.principal_id:
+        return False, "missing on-behalf-of principal"
+    if not context.requested_tool:
+        return False, "missing requested tool"
+
+    try:
+        principals = json.loads(_PRINCIPALS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "trusted principal registry is unavailable"
+    principal = principals.get(context.principal_id)
+    if not isinstance(principal, dict):
+        return False, f"unknown principal: {context.principal_id}"
+
+    if not context.expires_at:
+        return False, "missing delegation expiry"
+    try:
+        expiry = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            return False, "delegation expiry must include a timezone"
+        if expiry.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            return False, "delegation has expired"
+    except ValueError:
+        return False, "delegation expiry is not valid ISO-8601"
+
+    purposes = set(principal.get("purposes", []))
+    if context.request_purpose not in purposes:
+        return False, f"purpose {context.request_purpose!r} is not allowed for principal"
+
+    allowed_tools = set(principal.get("allowed_tools", []))
+    effective_tools = allowed_tools.intersection(context.agent_scopes)
+    if context.delegation_depth > 0:
+        effective_tools.intersection_update(context.parent_scopes)
+    if context.requested_tool not in effective_tools:
+        return False, f"tool {context.requested_tool!r} is outside effective OBO scope"
+
+    return True, (
+        f"principal {context.principal_id!r} may use {context.requested_tool!r} "
+        f"for purpose {context.request_purpose!r}"
+    )
